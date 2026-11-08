@@ -1,0 +1,20 @@
+{
+  "mac": "aa:bb:cc:dd:ee:ff",
+  "host": "192.168.1.50",
+  "linux": "linux-username",
+  "win": "windows-username",
+  "linux_password": "...",
+  "win_password": "...",
+
+  "broadcast": "255.255.255.255",
+  "boot_timeout": 300,
+  "ssh_key": "~/.ssh/turnon_ed25519",
+  "windows_grub_entry": "Windows",
+  "sddm_session": "",
+  "sunshine": true,
+  "sunshine_unit": "app-dev.lizardbyte.app.Sunshine.service",
+  "dim": true,
+  "moonlight": true,
+  "moonlight_path": "/Applications/Moonlight.app/Contents/MacOS/Moonlight",
+  "moonlight_delay": 5
+}

@@ -6,6 +6,7 @@
     python3 turnon.py windows
     python3 turnon.py status
     python3 turnon.py off        # shut the PC down (whichever OS is running)
+    python3 turnon.py init       # first-time setup wizard (MAC, accounts, passwords)
 
 What it does
   1. Sends Wake-on-LAN magic packets to the PC (if it's off).
@@ -23,14 +24,21 @@ One-time prerequisites on the PC (can't be done from here):
   * The account password is set in ~/.turnon.json, and it's an admin / sudoer on both OSes.
   * Mac and PC on the same LAN.
 
-Config (env vars override the defaults):
-  LINUX_USER / WIN_USER  account name on each OS (asked once, remembered in ~/.turnon.json)
-  PC_USER       shortcut if both OSes use the same name
-  linux_password / win_password   keys in ~/.turnon.json (or LINUX_PASSWORD / WIN_PASSWORD env)
-  PC_HOST       PC's IP; if unset it's looked up in the Mac's ARP table by MAC
-                (works once the PC has been on the network recently), then ~/.turnon.json
-  BROADCAST     e.g. 192.168.1.255 if 255.255.255.255 doesn't wake it
-  SDDM_SESSION  only for SDDM autologin, e.g. plasma
+Config lives in ~/.turnon.json (override the path with TURNON_CONFIG); run `turnon.py init` to create it.
+Every setting can also be given as an upper-case env var (e.g. BROADCAST); env wins over the file.
+See turnon.example.json for all keys. Required: mac, linux, win, linux_password, win_password.
+  mac / PC_MAC             PC's MAC address (required, for Wake-on-LAN and finding its IP)
+  host / PC_HOST           PC's IP; if unset it's looked up in the Mac's ARP table by MAC
+  linux, win / PC_USER     account names (LINUX_USER / WIN_USER env; PC_USER if both are the same)
+  linux_password, win_password   (or LINUX_PASSWORD / WIN_PASSWORD env)
+  broadcast                e.g. 192.168.1.255 if 255.255.255.255 doesn't wake it
+  boot_timeout             seconds to wait for the PC to come up (300)
+  ssh_key                  key tried before the password (~/.ssh/turnon_ed25519)
+  windows_grub_entry       substring of the GRUB menu entry that boots Windows ("Windows")
+  sddm_session             only for SDDM autologin, e.g. plasma
+  sunshine (true), sunshine_unit   start Sunshine after Linux login / its systemd user unit name
+  dim (true)               put monitors in DDC standby after the tool boots the PC
+  moonlight (true), moonlight_path, moonlight_delay (5)
 """
 import atexit
 import base64
@@ -46,13 +54,7 @@ import sys
 import tempfile
 import time
 
-MAC = "d8:43:ae:c3:5f:c4"
-BROADCAST = os.environ.get("BROADCAST", "255.255.255.255")
-MOONLIGHT = "/Applications/Moonlight.app/Contents/MacOS/Moonlight"
-MOONLIGHT_DELAY = int(os.environ.get("MOONLIGHT_DELAY", "5"))  # let Moonlight see the PC come online
-BOOT_TIMEOUT = 300          # seconds to wait for the PC to come up
-CONFIG = os.path.expanduser("~/.turnon.json")
-KEY = os.path.expanduser("~/.ssh/turnon_ed25519")   # tried first; falls back to the password
+CONFIG = os.path.expanduser(os.environ.get("TURNON_CONFIG", "~/.turnon.json"))
 
 
 # ---------------------------------------------------------------- config ----
@@ -71,6 +73,30 @@ def _save(**kv):
         json.dump(cfg, f)
 
 
+def opt(name, default=None):
+    """Setting lookup: env var NAME, then "name" in the config file, then the default."""
+    v = os.environ.get(name.upper())
+    if v not in (None, ""):
+        return v
+    v = _load().get(name.lower())
+    return default if v in (None, "") else v
+
+
+def flag(name, default=True):
+    """Boolean setting. Env: 0/false/no/off disables. Config: true/false."""
+    v = opt(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() not in ("0", "false", "no", "off")
+
+
+BROADCAST = opt("broadcast", "255.255.255.255")
+MOONLIGHT = os.path.expanduser(opt("moonlight_path", "/Applications/Moonlight.app/Contents/MacOS/Moonlight"))
+MOONLIGHT_DELAY = int(opt("moonlight_delay", 5))    # let Moonlight see the PC come online
+BOOT_TIMEOUT = int(opt("boot_timeout", 300))        # seconds to wait for the PC to come up
+KEY = os.path.expanduser(opt("ssh_key", "~/.ssh/turnon_ed25519"))   # tried first; falls back to the password
+WINDOWS_ENTRY = opt("windows_grub_entry", "Windows")  # substring of the GRUB menu entry that boots Windows
+SUNSHINE_UNIT = opt("sunshine_unit", "app-dev.lizardbyte.app.Sunshine.service")
 LINUX_PW = os.environ.get("LINUX_PASSWORD") or _load().get("linux_password", "")
 WIN_PW = os.environ.get("WIN_PASSWORD") or _load().get("win_password", "")
 
@@ -103,6 +129,14 @@ def win_user():
     return _account("win", "Windows")
 
 
+def mac():
+    m = _norm_mac(os.environ.get("PC_MAC") or _load().get("mac", ""))
+    if not m:
+        sys.exit("Your PC's MAC address isn't set. Run `python3 turnon.py init`, or set \"mac\" in "
+                 f"{CONFIG} (or PC_MAC=aa:bb:cc:dd:ee:ff).")
+    return m
+
+
 def host():
     h = os.environ.get("PC_HOST")
     if h:
@@ -110,7 +144,7 @@ def host():
     out = subprocess.run(["arp", "-an"], capture_output=True, text=True).stdout
     for line in out.splitlines():
         m = re.search(r"\(([\d.]+)\) at ([0-9a-f:]+)", line)
-        if m and _norm_mac(m.group(2)) == _norm_mac(MAC):
+        if m and _norm_mac(m.group(2)) == mac():
             _save(host=m.group(1))
             return m.group(1)
     return _load().get("host")
@@ -118,8 +152,7 @@ def host():
 
 # ------------------------------------------------------------ wake on lan ---
 def wake():
-    mac = bytes.fromhex(_norm_mac(MAC).replace(":", ""))
-    pkt = b"\xff" * 6 + mac * 16
+    pkt = b"\xff" * 6 + bytes.fromhex(mac().replace(":", "")) * 16
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for _ in range(3):  # UDP is lossy
@@ -214,6 +247,8 @@ import os, re, shutil, subprocess, sys, time
 
 mode, user = sys.argv[1], sys.argv[2]
 session = sys.argv[3] if len(sys.argv) > 3 else ""
+win_entry = sys.argv[4] if len(sys.argv) > 4 else "Windows"
+SUNSHINE_UNIT = sys.argv[5] if len(sys.argv) > 5 else "app-dev.lizardbyte.app.Sunshine.service"
 
 def run(*a):
     return subprocess.run(a, capture_output=True, text=True)
@@ -276,9 +311,10 @@ def windows():
         if subprocess.run(cmd, capture_output=True).returncode:
             print("update-grub failed"); sys.exit(4)
     cfg = next((c for c in ("/boot/grub/grub.cfg", "/boot/grub2/grub.cfg") if os.path.exists(c)), None)
-    m = re.search(r"menuentry\s+'([^']*Windows[^']*)'", read(cfg) if cfg else "")
+    m = next((x for x in re.finditer(r"menuentry\s+'([^']*)'", read(cfg) if cfg else "")
+              if win_entry in x.group(1)), None)
     if not m:
-        print("no Windows entry found in grub.cfg"); sys.exit(5)
+        print("no GRUB entry containing %r found in grub.cfg (set windows_grub_entry)" % win_entry); sys.exit(5)
     rb = shutil.which("grub-reboot") or shutil.which("grub2-reboot")
     if subprocess.run([rb, m.group(1)]).returncode:
         print("grub-reboot failed"); sys.exit(6)
@@ -306,8 +342,6 @@ def dim():
     print("DIMMED %d/%d monitors" % (done, n))
     if not n or done < n:
         sys.exit(8)
-
-SUNSHINE_UNIT = "app-dev.lizardbyte.app.Sunshine.service"
 
 def sunshine():
     """Make sure Sunshine (the Moonlight host) is running in the user's desktop session.
@@ -365,7 +399,7 @@ else:
 
 def linux_remote(mode):
     b64 = base64.b64encode(REMOTE.encode()).decode()
-    args = " ".join(shlex.quote(a) for a in (mode, linux_user(), os.environ.get("SDDM_SESSION", "")))
+    args = " ".join(shlex.quote(a) for a in (mode, linux_user(), opt("sddm_session", ""), WINDOWS_ENTRY, SUNSHINE_UNIT))
     cmd = (f"printf '%s\\n' {shlex.quote(LINUX_PW)} | sudo -S -p '' "
            f"python3 -c \"import base64;exec(base64.b64decode('{b64}'))\" {args}")
     r = ssh(linux_user(), cmd, timeout=180)
@@ -471,6 +505,41 @@ def windows_dim(script=None):
     print("Windows: monitor dimming didn't report back (is the desktop logged in?)")
 
 
+# ------------------------------------------------------------------- setup ---
+def init():
+    """Interactive first-time setup: writes the essentials to the config file."""
+    import getpass
+    cfg = _load()
+    print(f"Setting up {CONFIG} (press Enter to keep the value in [brackets]).\n")
+
+    def ask(key, prompt, secret=False, required=True):
+        cur = cfg.get(key, "")
+        shown = "set" if secret and cur else cur
+        while True:
+            v = (getpass.getpass if secret else input)(f"{prompt}" + (f" [{shown}]" if shown else "") + ": ").strip()
+            v = v or cur
+            if v or not required:
+                return v
+    while True:
+        cfg["mac"] = ask("mac", "PC's MAC address (aa:bb:cc:dd:ee:ff)")
+        if _norm_mac(cfg["mac"]):
+            cfg["mac"] = _norm_mac(cfg["mac"])
+            break
+        print("  That doesn't look like a MAC address.")
+    h = ask("host", "PC's IP (blank = auto-detect from this Mac's ARP table)", required=False)
+    if h:
+        cfg["host"] = h
+    cfg["linux"] = ask("linux", "Linux account name")
+    cfg["linux_password"] = ask("linux_password", "Linux password (used for SSH + sudo)", secret=True)
+    cfg["win"] = ask("win", "Windows account name")
+    cfg["win_password"] = ask("win_password", "Windows password", secret=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG, 0o600)
+    print(f"\nSaved. Optional settings (broadcast, windows_grub_entry, sunshine, dim, ...) are listed in "
+          "turnon.example.json; try `python3 turnon.py status`.")
+
+
 # ------------------------------------------------------------------- flow ---
 def reboot_and_wait(label):
     print(f"{label} ...", end="", flush=True)
@@ -487,7 +556,7 @@ def reboot_and_wait(label):
 def dim_monitors(cur):
     """DDC standby on the PC's monitors (fully black).
     Disable with NO_DIM=1 or "dim": false in ~/.turnon.json."""
-    if os.environ.get("NO_DIM") or _load().get("dim") is False:
+    if os.environ.get("NO_DIM") or not flag("dim"):
         return
     if cur == "linux":
         print(f"Monitors: {linux_remote('dim')}")
@@ -525,7 +594,8 @@ def boot(target):
         if cur == "linux":
             if target == "linux":
                 print(f"Linux auto-login: {linux_remote('autologin')}")
-                print(f"Sunshine: {linux_remote('sunshine')}")
+                if flag("sunshine"):
+                    print(f"Sunshine: {linux_remote('sunshine')}")
                 if fresh:
                     dim_monitors("linux")
                 return print("Done: PC is in Linux and logged in.")
@@ -579,8 +649,8 @@ def turn_off():
 
 def launch_moonlight(target):
     """Open Moonlight's host list (click the PC named 'linux' / 'windows' to pick an app)."""
-    if os.environ.get("NO_MOONLIGHT") or not os.path.exists(MOONLIGHT):
-        return print("Moonlight not found; skipping.")
+    if os.environ.get("NO_MOONLIGHT") or not flag("moonlight") or not os.path.exists(MOONLIGHT):
+        return print("Moonlight disabled or not found; skipping.")
     print(f"Waiting {MOONLIGHT_DELAY}s for Moonlight to see the PC ...", flush=True)
     time.sleep(MOONLIGHT_DELAY)
     print(f"Opening Moonlight (pick '{target}' to choose an app)")
@@ -592,7 +662,9 @@ def main():
     if not arg:
         print("Boot the PC into:\n  1) Linux\n  2) Windows\n  3) Turn off")
         arg = {"1": "linux", "2": "windows", "3": "off", "l": "linux", "w": "windows", "o": "off"}.get(input("> ").strip().lower(), "")
-    if arg == "status":
+    if arg == "init":
+        init()
+    elif arg == "status":
         print(detect())
     elif arg == "off":
         turn_off()
