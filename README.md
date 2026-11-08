@@ -34,3 +34,8 @@ When the tool powers on or reboots the PC, it puts the monitors in DDC standby (
 (Linux: `ddcutil`, installed automatically; Windows: a `TurnOnDim` scheduled task that runs
 `C:\ProgramData\turnon\dim.ps1` in the desktop session, only when the tool asks). The monitors remember
 the value. Disable with `NO_DIM=1` or `"dim": false` in `~/.turnon.json`.
+
+## Sunshine (Moonlight host)
+On Linux Mint, Sunshine's user service is tied to `graphical-session.target`, which Cinnamon never
+reaches, so it doesn't start after boot and Moonlight shows the PC as offline. After login the tool now
+starts it (and installs `~/.config/autostart/turnon-sunshine.desktop` so it also starts with the desktop).

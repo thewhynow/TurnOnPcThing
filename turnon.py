@@ -208,7 +208,7 @@ def wait_for_shutdown(timeout=120):
 
 
 # ---------------------------------------------------------- Linux (remote) --
-# Runs on the PC as root (via sudo). Modes: autologin | windows | dim
+# Runs on the PC as root (via sudo). Modes: autologin | windows | dim | sunshine
 REMOTE = r'''
 import os, re, shutil, subprocess, sys, time
 
@@ -307,7 +307,47 @@ def dim():
     if not n or done < n:
         sys.exit(8)
 
-if mode == "dim":
+SUNSHINE_UNIT = "app-dev.lizardbyte.app.Sunshine.service"
+
+def sunshine():
+    """Make sure Sunshine (the Moonlight host) is running in the user's desktop session.
+    Its user unit is WantedBy=graphical-session.target, which Cinnamon/MATE (Linux Mint) never
+    activates, so after a boot nothing starts it and Moonlight shows the PC as offline."""
+    if not shutil.which("sunshine"):
+        print("sunshine isn't installed"); return
+    import pwd
+    pw = pwd.getpwnam(user)
+    d = os.path.join(pw.pw_dir, ".config/autostart")
+    f = os.path.join(d, "turnon-sunshine.desktop")
+    if put(f, "[Desktop Entry]\nType=Application\nName=Sunshine (turnon)\n"
+           "Exec=sh -c 'systemctl --user import-environment DISPLAY XAUTHORITY WAYLAND_DISPLAY; "
+           "systemctl --user start %s'\nX-GNOME-Autostart-enabled=true\n" % SUNSHINE_UNIT):
+        for q in (d, f):
+            os.chown(q, pw.pw_uid, pw.pw_gid)
+    for _ in range(45):  # wait for the desktop session
+        if gui_logged_in():
+            break
+        time.sleep(2)
+    else:
+        print("no desktop session yet; Sunshine will start with the desktop autostart"); return
+    env = ["env", "XDG_RUNTIME_DIR=/run/user/%d" % pw.pw_uid]
+    def uctl(*a):
+        return run("runuser", "-u", user, "--", *env, "systemctl", "--user", *a)
+    time.sleep(5)  # let the session export DISPLAY etc.
+    if "DISPLAY=" not in uctl("show-environment").stdout:
+        uctl("set-environment", "DISPLAY=:0")
+    for _ in range(3):
+        if uctl("is-active", SUNSHINE_UNIT).stdout.strip() != "active":
+            uctl("start", SUNSHINE_UNIT)
+        for _ in range(15):
+            if ":47989" in run("ss", "-ltn").stdout:
+                print("SUNSHINE running"); return
+            time.sleep(2)
+    print("SUNSHINE didn't start"); sys.exit(9)
+
+if mode == "sunshine":
+    sunshine()
+elif mode == "dim":
     dim()
 elif mode == "autologin":
     if autologin():
@@ -485,6 +525,7 @@ def boot(target):
         if cur == "linux":
             if target == "linux":
                 print(f"Linux auto-login: {linux_remote('autologin')}")
+                print(f"Sunshine: {linux_remote('sunshine')}")
                 if fresh:
                     dim_monitors("linux")
                 return print("Done: PC is in Linux and logged in.")
