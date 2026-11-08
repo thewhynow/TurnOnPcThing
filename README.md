@@ -28,3 +28,9 @@ Create `~/.turnon.json` (never committed):
 Windows is controlled over SSH with a dedicated key (`~/.ssh/turnon_ed25519`, add its `.pub` to
 `C:\ProgramData\ssh\administrators_authorized_keys`); Linux uses password SSH.
 See the docstring at the top of `turnon.py` for PC-side prerequisites (WoL, OpenSSH, GRUB).
+
+## Monitors
+When the tool powers on or reboots the PC, it puts the monitors in DDC standby (fully black)
+(Linux: `ddcutil`, installed automatically; Windows: a `TurnOnDim` scheduled task that runs
+`C:\ProgramData\turnon\dim.ps1` in the desktop session, only when the tool asks). The monitors remember
+the value. Disable with `NO_DIM=1` or `"dim": false` in `~/.turnon.json`.

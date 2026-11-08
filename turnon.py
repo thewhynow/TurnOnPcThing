@@ -33,6 +33,7 @@ Config (env vars override the defaults):
 """
 import atexit
 import base64
+import gzip
 import json
 import os
 import re
@@ -45,7 +46,7 @@ import tempfile
 import time
 
 MAC = "d8:43:ae:c3:5f:c4"
-WIN_BROADCAST = os.environ.get("BROADCAST", "255.255.255.255")
+BROADCAST = os.environ.get("BROADCAST", "255.255.255.255")
 MOONLIGHT = "/Applications/Moonlight.app/Contents/MacOS/Moonlight"
 MOONLIGHT_DELAY = int(os.environ.get("MOONLIGHT_DELAY", "5"))  # let Moonlight see the PC come online
 BOOT_TIMEOUT = 300          # seconds to wait for the PC to come up
@@ -206,9 +207,9 @@ def wait_for_shutdown(timeout=120):
 
 
 # ---------------------------------------------------------- Linux (remote) --
-# Runs on the PC as root (via sudo). Modes: autologin | windows
+# Runs on the PC as root (via sudo). Modes: autologin | windows | dim
 REMOTE = r'''
-import os, re, shutil, subprocess, sys
+import os, re, shutil, subprocess, sys, time
 
 mode, user = sys.argv[1], sys.argv[2]
 session = sys.argv[3] if len(sys.argv) > 3 else ""
@@ -284,7 +285,30 @@ def windows():
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("REBOOTING into: " + m.group(1))
 
-if mode == "autologin":
+def dim():
+    """Put every DDC/CI monitor in standby (VCP d6=4) so the panels go fully dark."""
+    if not shutil.which("ddcutil"):
+        apt = shutil.which("apt-get")
+        if not apt or subprocess.run([apt, "install", "-y", "ddcutil"], capture_output=True,
+                                     env=dict(os.environ, DEBIAN_FRONTEND="noninteractive")).returncode:
+            print("ddcutil isn't installed and couldn't be installed"); sys.exit(7)
+    put("/etc/modules-load.d/i2c-dev.conf", "i2c-dev\n")
+    run("modprobe", "i2c-dev")
+    n = done = 0
+    for _ in range(5):  # displays can take a moment to answer right after boot
+        ids = re.findall(r"^Display (\d+)", run("ddcutil", "detect", "--brief").stdout, re.M)
+        n = len(ids)
+        done = sum(run("ddcutil", "setvcp", "d6", "4", "--display", i).returncode == 0 for i in ids)
+        if n and done == n:
+            break
+        time.sleep(3)
+    print("DIMMED %d/%d monitors" % (done, n))
+    if not n or done < n:
+        sys.exit(8)
+
+if mode == "dim":
+    dim()
+elif mode == "autologin":
     if autologin():
         if gui_logged_in():
             print("CHANGED (someone is logged in; takes effect on next boot)")
@@ -336,6 +360,76 @@ def windows_autologin():
     return changed
 
 
+# Windows monitor control (DDC/CI via dxva2). SSH sessions can't see the monitors, so the PowerShell
+# script is run through an interactive scheduled task (runs in the logged-in desktop session).
+WIN_DIM_PS1 = r'''Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class Dim {
+  delegate bool Cb(IntPtr m, IntPtr dc, IntPtr r, IntPtr d);
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct P { public IntPtr h; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string s; }
+  [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr c, Cb f, IntPtr d);
+  [DllImport("dxva2.dll")] static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr m, out uint n);
+  [DllImport("dxva2.dll")] static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr m, uint n, [Out] P[] a);
+  [DllImport("dxva2.dll")] static extern bool GetMonitorBrightness(IntPtr h, out uint lo, out uint cur, out uint hi);
+  [DllImport("dxva2.dll")] static extern bool SetMonitorBrightness(IntPtr h, uint v);
+  [DllImport("dxva2.dll")] static extern bool DestroyPhysicalMonitor(IntPtr h);
+  [DllImport("dxva2.dll")] static extern bool SetVCPFeature(IntPtr h, byte code, uint v);
+  public static int Total, Done;
+  public static void Run() {
+    Total = 0; Done = 0;
+    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (m, dc, r, d) => {
+      uint n; if (!GetNumberOfPhysicalMonitorsFromHMONITOR(m, out n) || n == 0) return true;
+      var a = new P[n]; if (!GetPhysicalMonitorsFromHMONITOR(m, n, a)) return true;
+      foreach (var p in a) {
+        uint lo, cur, hi; Total++;
+        if (SetVCPFeature(p.h, 0xD6, 4)) Done++;
+        DestroyPhysicalMonitor(p.h);
+      }
+      return true;
+    }, IntPtr.Zero);
+  }
+}
+'@
+for ($i = 0; $i -lt 5; $i++) { [Dim]::Run(); if ([Dim]::Total -gt 0 -and [Dim]::Done -eq [Dim]::Total) { break }; Start-Sleep 3 }
+$ok = [Dim]::Total -gt 0 -and [Dim]::Done -eq [Dim]::Total
+"DIMMED $([Dim]::Done)/$([Dim]::Total) monitors" | Out-File C:\ProgramData\turnon\dim.log -Encoding ascii -Force
+if (-not $ok) { exit 8 }
+'''
+WIN_DIM_DIR = r"C:\ProgramData\turnon"
+WIN_DIM_TASK = "TurnOnDim"
+
+
+def windows_dim(script=None):
+    """Put every monitor in DDC standby from inside the Windows desktop session."""
+    gz = base64.b64encode(gzip.compress((script or WIN_DIM_PS1).encode())).decode()
+    install = (f"$d='{WIN_DIM_DIR}'; New-Item -ItemType Directory -Force $d | Out-Null; "
+               f"$g=New-Object IO.MemoryStream (,[Convert]::FromBase64String('{gz}')); "
+               "$z=New-Object IO.Compression.GzipStream($g,[IO.Compression.CompressionMode]::Decompress); "
+               "$o=New-Object IO.MemoryStream; $z.CopyTo($o); "
+               "[IO.File]::WriteAllBytes(\"$d\\dim.ps1\", $o.ToArray())")
+    enc = base64.b64encode(install.encode("utf-16-le")).decode()
+    r = wssh("powershell -NoProfile -EncodedCommand " + enc)
+    if r.returncode:
+        return print(f"Couldn't install the monitor script on Windows: {r.stdout}{r.stderr}".strip())
+    log = rf"{WIN_DIM_DIR}\dim.log"
+    wssh(f'del /q "{log}"')
+    # never-firing trigger: the task only runs when we ask (/it = only in the user's logged-in session)
+    tr = rf'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File {WIN_DIM_DIR}\dim.ps1'
+    r = wssh(f'schtasks /create /tn {WIN_DIM_TASK} /tr "{tr}" /sc once /sd 01/01/2000 /st 00:00 '
+             f'/ru {win_user()} /it /rl highest /f')
+    if r.returncode:
+        return print(f"Couldn't create the monitor task: {r.stdout}{r.stderr}".strip())
+    wssh(f"schtasks /run /tn {WIN_DIM_TASK}")
+    for _ in range(20):
+        time.sleep(2)
+        out = wssh(f'type "{log}"').stdout.strip()
+        if out.startswith("DIMMED"):
+            return print(f"Windows: {out}")
+    print("Windows: monitor dimming didn't report back (is the desktop logged in?)")
+
+
 # ------------------------------------------------------------------- flow ---
 def reboot_and_wait(label):
     print(f"{label} ...", end="", flush=True)
@@ -347,6 +441,17 @@ def reboot_and_wait(label):
     if not cur:
         sys.exit("Timed out waiting for the PC to come back up (is sshd running on that OS?).")
     return cur
+
+
+def dim_monitors(cur):
+    """DDC standby on the PC's monitors (fully black).
+    Disable with NO_DIM=1 or "dim": false in ~/.turnon.json."""
+    if os.environ.get("NO_DIM") or _load().get("dim") is False:
+        return
+    if cur == "linux":
+        print(f"Monitors: {linux_remote('dim')}")
+    else:
+        windows_dim()
 
 
 def boot(target):
@@ -362,6 +467,7 @@ def boot(target):
         else:
             sys.exit("Couldn't find the PC. Set PC_HOST=<ip>.")
     cur = detect()
+    fresh = cur == "off"  # the PC (re)booted during this run
     print(f"PC is currently: {cur}")
     if cur == "off":
         wake()
@@ -378,18 +484,24 @@ def boot(target):
         if cur == "linux":
             if target == "linux":
                 print(f"Linux auto-login: {linux_remote('autologin')}")
+                if fresh:
+                    dim_monitors("linux")
                 return print("Done: PC is in Linux and logged in.")
             print("Setting GRUB next-boot to Windows and rebooting ...")
             print(linux_remote("windows"))
             cur = reboot_and_wait("Rebooting")
+            fresh = True
         else:  # windows
             changed = windows_autologin()
             if target == "windows" and not changed:
+                if fresh:
+                    dim_monitors("windows")
                 return print("Done: PC is in Windows and logged in.")
             print("Enabled Windows auto-login; " if changed else "", end="")
             print("rebooting Windows" + (" (GRUB then boots Linux)" if target == "windows" else " into Linux"))
             wssh("shutdown /r /t 0")
             cur = reboot_and_wait("Rebooting")
+            fresh = True
     sys.exit("Gave up: PC didn't settle into the requested OS.")
 
 
