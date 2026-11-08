@@ -11,7 +11,7 @@ Needs Xcode command line tools (`swiftc`). Then launch **PC Boot** from Launchpa
 ## CLI
 ```
 python3 turnon.py            # menu
-python3 turnon.py linux|windows|status
+python3 turnon.py linux|windows|status|off
 ```
 
 ## Config

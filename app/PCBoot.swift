@@ -6,7 +6,7 @@ struct PCBootApp: App {
     var body: some Scene {
         WindowGroup("PC Boot") {
             ContentView()
-                .frame(width: 440)
+                .frame(width: 560)
         }
         .windowResizability(.contentSize)
     }
@@ -169,6 +169,8 @@ struct ContentView: View {
                          isRunning: r.target == "linux", disabled: r.busy) { r.boot("linux") }
                 OSButton(title: "Windows", symbol: "macwindow", tint: .blue,
                          isRunning: r.target == "windows", disabled: r.busy) { r.boot("windows") }
+                OSButton(title: "Turn Off", symbol: "power", tint: .red,
+                         isRunning: r.target == "off", disabled: r.busy) { r.boot("off") }
             }
 
             Toggle("Open Moonlight when ready", isOn: $r.openMoonlight)

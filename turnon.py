@@ -5,6 +5,7 @@
     python3 turnon.py linux
     python3 turnon.py windows
     python3 turnon.py status
+    python3 turnon.py off        # shut the PC down (whichever OS is running)
 
 What it does
   1. Sends Wake-on-LAN magic packets to the PC (if it's off).
@@ -505,6 +506,36 @@ def boot(target):
     sys.exit("Gave up: PC didn't settle into the requested OS.")
 
 
+def linux_poweroff_cmd():
+    return f"printf '%s\\n' {shlex.quote(LINUX_PW)} | sudo -S -p '' systemctl poweroff"
+
+
+WIN_POWEROFF_CMD = "shutdown /s /t 0"
+
+
+def turn_off():
+    cur = detect()
+    print(f"PC is currently: {cur}")
+    if cur == "off":
+        return print("PC is already off.")
+    if cur == "unknown":
+        sys.exit("PC answers on port 22 but SSH login failed. Check LINUX_USER/WIN_USER (or ~/.turnon.json) and the password.")
+    if cur == "linux":
+        if not LINUX_PW:
+            sys.exit("Set \"linux_password\" in ~/.turnon.json")
+        r = ssh(linux_user(), linux_poweroff_cmd(), timeout=60)
+    else:
+        r = wssh(WIN_POWEROFF_CMD)
+    if r.returncode not in (0, 255):  # 255: connection dropped as the PC went down
+        sys.exit(f"Shutdown command failed ({r.returncode}): {(r.stdout + r.stderr).strip()}")
+    print("Shutting down", end="", flush=True)
+    ok = wait_for_shutdown()
+    print()
+    if not ok:
+        sys.exit("PC is still answering on port 22 after 2 minutes.")
+    print("Done: PC is off.")
+
+
 def launch_moonlight(target):
     """Open Moonlight's host list (click the PC named 'linux' / 'windows' to pick an app)."""
     if os.environ.get("NO_MOONLIGHT") or not os.path.exists(MOONLIGHT):
@@ -518,10 +549,12 @@ def launch_moonlight(target):
 def main():
     arg = sys.argv[1].lower() if len(sys.argv) > 1 else ""
     if not arg:
-        print("Boot the PC into:\n  1) Linux\n  2) Windows")
-        arg = {"1": "linux", "2": "windows", "l": "linux", "w": "windows"}.get(input("> ").strip().lower(), "")
+        print("Boot the PC into:\n  1) Linux\n  2) Windows\n  3) Turn off")
+        arg = {"1": "linux", "2": "windows", "3": "off", "l": "linux", "w": "windows", "o": "off"}.get(input("> ").strip().lower(), "")
     if arg == "status":
         print(detect())
+    elif arg == "off":
+        turn_off()
     elif arg in ("linux", "windows"):
         boot(arg)
         launch_moonlight(arg)
