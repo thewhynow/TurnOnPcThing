@@ -7,11 +7,13 @@
     python3 turnon.py status
     python3 turnon.py off        # shut the PC down (whichever OS is running)
     python3 turnon.py init       # first-time setup wizard (MAC, accounts, passwords)
+    python3 turnon.py default windows|linux   # which OS GRUB boots on a plain power-on
 
 What it does
   1. Sends Wake-on-LAN magic packets to the PC (if it's off).
-  2. Gets the PC into the OS you picked (GRUB defaults to Linux; for Windows it
-     runs `grub-reboot` + reboot over SSH; from Windows -> Linux it just reboots).
+  2. Gets the PC into the OS you picked. Linux -> Windows runs `grub-reboot` + reboot over SSH.
+     Windows -> Linux just reboots, unless GRUB defaults to Windows (see `default`): then it first
+     leaves a one-time "boot Linux" flag on the EFI System Partition for GRUB to consume.
   3. Logs into the default account with the passwords in ~/.turnon.json. A lock screen can't be
      typed into remotely, so this enables *auto-login* on the PC the first time it
      can reach it over SSH (Windows: Winlogon registry keys; Linux: GDM/SDDM/LightDM).
@@ -34,6 +36,7 @@ See turnon.example.json for all keys. Required: mac, linux, win, linux_password,
   broadcast                e.g. 192.168.1.255 if 255.255.255.255 doesn't wake it
   boot_timeout             seconds to wait for the PC to come up (300)
   ssh_key                  key tried before the password (~/.ssh/turnon_ed25519)
+  default_os               what GRUB boots by default, "linux" or "windows"; set it with `default`
   windows_grub_entry       substring of the GRUB menu entry that boots Windows ("Windows")
   sddm_session             only for SDDM autologin, e.g. plasma
   sunshine (true), sunshine_unit   start Sunshine after Linux login / its systemd user unit name
@@ -241,7 +244,7 @@ def wait_for_shutdown(timeout=120):
 
 
 # ---------------------------------------------------------- Linux (remote) --
-# Runs on the PC as root (via sudo). Modes: autologin | windows | dim | sunshine
+# Runs on the PC as root (via sudo). Modes: autologin | windows | dim | sunshine | default-windows | default-linux
 REMOTE = r'''
 import os, re, shutil, subprocess, sys, time
 
@@ -322,6 +325,66 @@ def windows():
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("REBOOTING into: " + m.group(1))
 
+def default_os(target):
+    """Choose what GRUB boots on a plain power-on. For Windows, install a grub.d hook that defaults to
+    the Windows entry unless a one-time flag on the EFI System Partition (the one place both OSes can
+    write, and where GRUB can clear it again) asks for Linux. `grub-reboot` still takes priority."""
+    hook = "/etc/grub.d/01_turnon"  # must run after 00_header, which sets $default
+    old = read(hook)
+    grub_cfg = next((c for c in ("/boot/grub/grub.cfg", "/boot/grub2/grub.cfg") if os.path.exists(c)), None)
+    if not grub_cfg:
+        print("grub.cfg not found"); sys.exit(4)
+    if target == "windows":
+        if not os.path.isdir("/sys/firmware/efi"):
+            print("a Windows default needs a UEFI PC"); sys.exit(10)
+        esp = next((p for p in ("/boot/efi", "/efi", "/boot")
+                    if run("findmnt", "-no", "FSTYPE", "--mountpoint", p).stdout.strip() == "vfat"), None)
+        if not esp:
+            print("EFI System Partition isn't mounted"); sys.exit(10)
+        uuid = run("findmnt", "-no", "UUID", "--mountpoint", esp).stdout.strip()
+        entry = None
+        for line in read(grub_cfg).splitlines():
+            m = re.match(r"\s*menuentry\s+'([^']*)'", line)
+            if m and win_entry in m.group(1):
+                # prefer the stable --id: titles include device names, which can change between boots
+                i = re.search(r"\$menuentry_id_option\s+'([^']*)'", line)
+                entry = i.group(1) if i else m.group(1)
+                break
+        if not entry or not uuid:
+            print("no GRUB entry containing %r found in grub.cfg (set windows_grub_entry)" % win_entry); sys.exit(5)
+        os.makedirs(esp + "/EFI/turnon", exist_ok=True)
+        editenv = shutil.which("grub-editenv") or shutil.which("grub2-editenv")
+        flag_file = esp + "/EFI/turnon/next.env"
+        if (subprocess.run([editenv, flag_file, "create"]).returncode
+                or subprocess.run([editenv, flag_file, "set", "turnon_next=none"]).returncode):
+            print("couldn't create the flag file"); sys.exit(11)
+        body = """if [ -z "${boot_once}" ]; then
+  set default="@ENTRY@"
+fi
+search --no-floppy --fs-uuid --set=turnon_esp @UUID@
+if [ -s ($turnon_esp)/EFI/turnon/next.env ]; then
+  load_env -f ($turnon_esp)/EFI/turnon/next.env turnon_next
+  if [ "${turnon_next}" = linux ]; then
+    set default=0
+    set turnon_next=none
+    save_env -f ($turnon_esp)/EFI/turnon/next.env turnon_next
+  fi
+fi
+""".replace("@ENTRY@", entry).replace("@UUID@", uuid)
+        put(hook, "#!/bin/sh\n# installed by turnon.py\ncat <<'TURNON'\n" + body + "TURNON\n")
+        os.chmod(hook, 0o755)
+    elif old:
+        os.remove(hook)
+    mk = shutil.which("update-grub")
+    cmd = [mk] if mk else [shutil.which("grub2-mkconfig") or "grub-mkconfig", "-o", grub_cfg]
+    if subprocess.run(cmd, capture_output=True).returncode:
+        if old:
+            put(hook, old); os.chmod(hook, 0o755)
+        elif os.path.exists(hook):
+            os.remove(hook)
+        print("update-grub failed; hook change rolled back"); sys.exit(4)
+    print("GRUB now boots %s by default" % target.capitalize())
+
 def dim():
     """Put every DDC/CI monitor in standby (VCP d6=4) so the panels go fully dark."""
     if not shutil.which("ddcutil"):
@@ -379,7 +442,9 @@ def sunshine():
             time.sleep(2)
     print("SUNSHINE didn't start"); sys.exit(9)
 
-if mode == "sunshine":
+if mode.startswith("default-"):
+    default_os(mode.split("-", 1)[1])
+elif mode == "sunshine":
     sunshine()
 elif mode == "dim":
     dim()
@@ -433,6 +498,31 @@ def windows_autologin():
         wssh(r'reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device" '
                         r'/v DevicePasswordLessBuildVersion /t REG_DWORD /d 0 /f')
     return changed
+
+
+# Writes the one-time "boot Linux" flag read by the GRUB hook: a GRUB environment block (exactly
+# 1024 bytes) on the EFI System Partition, which is mounted just long enough to write it.
+WIN_BOOT_LINUX_PS1 = r'''$ErrorActionPreference = 'Stop'
+$letter = 'ZYXWVUTSR'.ToCharArray() | Where-Object { -not (Test-Path "${_}:\") } | Select-Object -First 1
+mountvol "${letter}:" /s
+if ($LASTEXITCODE) { throw 'could not mount the EFI System Partition' }
+try {
+  $file = "${letter}:\EFI\turnon\next.env"
+  if (-not (Test-Path $file)) { throw 'flag file missing: run turnon.py default windows' }
+  $text = "# GRUB Environment Block`nturnon_next=linux`n"
+  $bytes = [Text.Encoding]::ASCII.GetBytes($text + ('#' * (1024 - $text.Length)))
+  [IO.File]::WriteAllBytes($file, $bytes)
+  'FLAGGED'
+} finally { mountvol "${letter}:" /d }
+'''
+
+
+def windows_boot_linux_next():
+    """Make the next boot go to Linux when GRUB defaults to Windows."""
+    enc = base64.b64encode(WIN_BOOT_LINUX_PS1.encode("utf-16-le")).decode()
+    r = wssh("powershell -NoProfile -EncodedCommand " + enc)
+    if r.returncode or "FLAGGED" not in r.stdout:
+        sys.exit(f"Couldn't tell GRUB to boot Linux next: {(r.stdout + r.stderr).strip()}")
 
 
 # Windows monitor control (DDC/CI via dxva2). SSH sessions can't see the monitors, so the PowerShell
@@ -610,7 +700,9 @@ def boot(target):
                     dim_monitors("windows")
                 return print("Done: PC is in Windows and logged in.")
             print("Enabled Windows auto-login; " if changed else "", end="")
-            print("rebooting Windows" + (" (GRUB then boots Linux)" if target == "windows" else " into Linux"))
+            if target == "linux" and opt("default_os", "linux") == "windows":
+                windows_boot_linux_next()
+            print("rebooting Windows" if target == "windows" else "rebooting Windows into Linux")
             wssh("shutdown /r /t 0")
             cur = reboot_and_wait("Rebooting")
             fresh = True
@@ -647,6 +739,17 @@ def turn_off():
     print("Done: PC is off.")
 
 
+def set_default(target):
+    """Make GRUB boot `target` on a plain power-on (e.g. when something else sends Wake-on-LAN)."""
+    if target not in ("linux", "windows"):
+        sys.exit("Usage: turnon.py default windows|linux")
+    if detect() != "linux":
+        boot("linux")
+    print(linux_remote("default-" + target))
+    _save(default_os=target)
+    os.chmod(CONFIG, 0o600)
+
+
 def launch_moonlight(target):
     """Open Moonlight's host list (click the PC named 'linux' / 'windows' to pick an app)."""
     if os.environ.get("NO_MOONLIGHT") or not flag("moonlight") or not os.path.exists(MOONLIGHT):
@@ -664,6 +767,8 @@ def main():
         arg = {"1": "linux", "2": "windows", "3": "off", "l": "linux", "w": "windows", "o": "off"}.get(input("> ").strip().lower(), "")
     if arg == "init":
         init()
+    elif arg == "default":
+        set_default(sys.argv[2].lower() if len(sys.argv) > 2 else "")
     elif arg == "status":
         print(detect())
     elif arg == "off":

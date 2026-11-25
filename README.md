@@ -12,7 +12,16 @@ Needs Xcode command line tools (`swiftc`). Then launch **PC Boot** from Launchpa
 ```
 python3 turnon.py            # menu
 python3 turnon.py init|linux|windows|status|off
+python3 turnon.py default windows|linux
 ```
+
+## Default OS
+GRUB boots Linux unless you change it. `python3 turnon.py default windows` makes a plain power-on boot Windows,
+so any Wake-on-LAN sender (such as a phone app) can start the PC into Windows (`default linux` undoes it).
+It needs a UEFI PC. It installs `/etc/grub.d/01_turnon`; to get to Linux from Windows, the tool writes a one-time
+flag to `EFI\turnon\next.env` on the EFI System Partition, which GRUB reads and clears.
+With Windows as the default, restarting from Linux also goes to Windows, and `linux` while the PC is off boots
+Windows first and then restarts into Linux. Auto-login on Windows is set up the first time the tool runs `windows`.
 
 ## Config
 Run the setup wizard, which writes `~/.turnon.json` (mode 600, never committed):
@@ -28,6 +37,7 @@ Or copy `turnon.example.json` there and edit it. Required: `mac` (your PC's MAC 
 | `broadcast` | `255.255.255.255` | WoL broadcast address, e.g. `192.168.1.255` if the default doesn't wake it |
 | `boot_timeout` | `300` | Seconds to wait for the PC to come up |
 | `ssh_key` | `~/.ssh/turnon_ed25519` | Key tried before the password |
+| `default_os` | `linux` | What GRUB boots by default; set it with the `default` command, not by hand |
 | `windows_grub_entry` | `Windows` | Substring of the GRUB menu entry that boots Windows |
 | `sddm_session` | – | Session for SDDM autologin, e.g. `plasma` |
 | `sunshine` / `sunshine_unit` | `true` / LizardByte Flatpak-style unit | Start Sunshine after Linux login |

@@ -9,6 +9,7 @@
   "broadcast": "255.255.255.255",
   "boot_timeout": 300,
   "ssh_key": "~/.ssh/turnon_ed25519",
+  "default_os": "linux",
   "windows_grub_entry": "Windows",
   "sddm_session": "",
   "sunshine": true,
